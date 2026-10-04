@@ -5,6 +5,13 @@ import {
   APPROVAL_ORDER,
   createAudit,
 } from '../models/change-request.model';
+import {
+  ackStep,
+  confirmPendingStep,
+  createLedger,
+  dispatchStep,
+  failPendingStep,
+} from '../models/execution-ledger.model';
 import { ChangeRequestActions } from './change-request.actions';
 
 export interface ChangeRequestState {
@@ -142,33 +149,51 @@ export const changeRequestReducer = createReducer(
   })),
   on(ChangeRequestActions.startExecution, (state, { id }) => ({
     ...state,
+    changes: state.changes.map((change) => {
+      if (change.id !== id || change.status !== 'approved') {
+        return change;
+      }
+      const now = new Date().toISOString();
+      // 建立可续接操作底账；此后所有前向步骤都经“待确认 → 回包确认”入账
+      const started: ChangeRequest = {
+        ...change,
+        status: 'executing',
+        approvals: change.approvals.map((approval) => ({ ...approval, state: 'frozen' })),
+        ledger: createLedger(change, now),
+        updatedAt: now,
+        audit: [createAudit('开始执行', '审批记录已冻结，建立可续接执行底账'), ...change.audit],
+      };
+      return started;
+    }),
+  })),
+  on(ChangeRequestActions.dispatchStep, (state, { id, stepId }) => ({
+    ...state,
+    changes: state.changes.map((change) => {
+      if (change.id !== id) {
+        return change;
+      }
+      return dispatchStep(change, stepId, new Date().toISOString()) ?? change;
+    }),
+  })),
+  on(ChangeRequestActions.ackStep, (state, { id, stepId, ackAt }) => ({
+    ...state,
     changes: state.changes.map((change) =>
-      change.id === id && change.status === 'approved'
-        ? touch({
-            ...change,
-            status: 'executing',
-            approvals: change.approvals.map((approval) => ({ ...approval, state: 'frozen' })),
-            audit: [createAudit('开始执行', '审批记录已冻结，进入执行状态'), ...change.audit],
-          })
-        : change,
+      change.id === id ? ackStep(change, stepId, ackAt) ?? change : change,
     ),
   })),
-  on(ChangeRequestActions.toggleStep, (state, { id, stepId }) => ({
+  on(ChangeRequestActions.confirmPendingStep, (state, { id, stepId, actor }) => ({
     ...state,
     changes: state.changes.map((change) =>
       change.id === id
-        ? touch({
-            ...change,
-            steps: change.steps.map((step) =>
-              step.id === stepId
-                ? {
-                    ...step,
-                    completed: !step.completed,
-                    completedAt: step.completed ? undefined : new Date().toISOString(),
-                  }
-                : step,
-            ),
-          })
+        ? confirmPendingStep(change, stepId, actor, new Date().toISOString()) ?? change
+        : change,
+    ),
+  })),
+  on(ChangeRequestActions.failPendingStep, (state, { id, stepId, reason, actor }) => ({
+    ...state,
+    changes: state.changes.map((change) =>
+      change.id === id
+        ? failPendingStep(change, stepId, reason, actor, new Date().toISOString()) ?? change
         : change,
     ),
   })),
@@ -189,17 +214,20 @@ export const changeRequestReducer = createReducer(
   })),
   on(ChangeRequestActions.completeExecution, (state, { id, result, note }) => ({
     ...state,
-    changes: state.changes.map((change) =>
-      change.id === id && change.status === 'executing'
-        ? touch({
-            ...change,
-            status: result,
-            audit: [
-              createAudit(result === 'completed' ? '执行完成' : '执行回滚', note),
-              ...change.audit,
-            ],
-          })
-        : change,
-    ),
+    changes: state.changes.map((change) => {
+      if (change.id !== id || change.status !== 'executing') {
+        return change;
+      }
+      // 底账已记录失败时不允许判定“完成”，只能落到已回滚
+      const effectiveResult = change.ledger?.failure && result === 'completed' ? 'rolled_back' : result;
+      return touch({
+        ...change,
+        status: effectiveResult,
+        audit: [
+          createAudit(effectiveResult === 'completed' ? '执行完成' : '执行回滚', note),
+          ...change.audit,
+        ],
+      });
+    }),
   })),
 );

@@ -182,6 +182,23 @@ import { selectAllChanges } from '../../store/change-request.selectors';
             <label>命令或操作</label>
             <input clrInput [ngModel]="stepCommand()" (ngModelChange)="stepCommand.set($event)" />
           </clr-input-container>
+          @if (stepPhase() === 'rollback') {
+            <clr-select-container>
+              <label>撤销哪个前向步骤</label>
+              <select
+                clrSelect
+                [ngModel]="revertStepId()"
+                (ngModelChange)="revertStepId.set($event)"
+              >
+                <option value="">不关联（按人工判断）</option>
+                @for (forward of forwardSteps(); track forward.id) {
+                  <option [value]="forward.id">
+                    {{ phaseLabel(forward.phase) }} · {{ forward.title }}
+                  </option>
+                }
+              </select>
+            </clr-select-container>
+          }
           <button class="btn" type="button" (click)="addStep()">添加步骤</button>
         </div>
 
@@ -442,7 +459,12 @@ export class NewChangeComponent {
   readonly stepPhase = signal<StepPhase>('execute');
   readonly stepOwner = signal('');
   readonly stepCommand = signal('');
+  readonly revertStepId = signal('');
   readonly resourceTypes: ResourceType[] = ['datacenter', 'rack', 'network', 'storage', 'service'];
+
+  readonly forwardSteps = computed(() =>
+    this.draft().steps.filter((step) => step.phase !== 'rollback'),
+  );
 
   readonly blockers = computed(
     () =>
@@ -535,11 +557,13 @@ export class NewChangeComponent {
       durationMinutes: 15,
       command: this.stepCommand().trim(),
       completed: false,
+      revertStepId: this.stepPhase() === 'rollback' ? this.revertStepId() || undefined : undefined,
     };
     this.draft.update((draft) => ({ ...draft, steps: [...draft.steps, step] }));
     this.stepTitle.set('');
     this.stepOwner.set('');
     this.stepCommand.set('');
+    this.revertStepId.set('');
   }
 
   removeStep(id: string): void {

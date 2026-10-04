@@ -1,3 +1,5 @@
+import type { ExecutionLedger } from './execution-ledger.model';
+
 export type ChangeStatus =
   | 'draft'
   | 'submitted'
@@ -31,6 +33,8 @@ export interface ChangeStep {
   command: string;
   completed: boolean;
   completedAt?: string;
+  /** 仅回滚步骤使用：该回滚步骤对应撤销的前向步骤 ID */
+  revertStepId?: string;
 }
 
 export interface ChangeWindow {
@@ -78,6 +82,8 @@ export interface ChangeRequest {
   approvals: ApprovalRecord[];
   deviations: DeviationRecord[];
   audit: AuditRecord[];
+  /** 可续接执行底账；旧记录没有该字段，步骤勾选只读展示 */
+  ledger?: ExecutionLedger;
   createdAt: string;
   updatedAt: string;
 }

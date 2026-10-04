@@ -4,7 +4,11 @@
     "title": "华东一区核心交换网升级",
     "summary": "升级 A3/A4 机柜上联交换机固件，调整核心链路聚合参数。",
     "owner": "周启明",
-    "onCall": ["周启明", "林珂", "赵宇"],
+    "onCall": [
+      "周启明",
+      "林珂",
+      "赵宇"
+    ],
     "status": "submitted",
     "risk": "critical",
     "resources": [
@@ -20,21 +24,29 @@
         "name": "A3 机柜",
         "type": "rack",
         "critical": false,
-        "dependencies": ["dc-east-1"]
+        "dependencies": [
+          "dc-east-1"
+        ]
       },
       {
         "id": "sw-core-a",
         "name": "核心交换机 A",
         "type": "network",
         "critical": true,
-        "dependencies": ["rack-a3", "rack-a4"]
+        "dependencies": [
+          "rack-a3",
+          "rack-a4"
+        ]
       },
       {
         "id": "svc-orders",
         "name": "订单网关",
         "type": "service",
         "critical": true,
-        "dependencies": ["sw-core-a", "storage-prod"]
+        "dependencies": [
+          "sw-core-a",
+          "storage-prod"
+        ]
       }
     ],
     "steps": [
@@ -73,7 +85,8 @@
         "owner": "",
         "durationMinutes": 35,
         "command": "",
-        "completed": false
+        "completed": false,
+        "revertStepId": "step-3"
       }
     ],
     "window": {
@@ -128,7 +141,10 @@
     "title": "结算存储扩容",
     "summary": "为结算集群增加 2 个存储节点并在线迁移数据。",
     "owner": "陈若宁",
-    "onCall": ["陈若宁", "高巍"],
+    "onCall": [
+      "陈若宁",
+      "高巍"
+    ],
     "status": "executing",
     "risk": "high",
     "resources": [
@@ -137,21 +153,27 @@
         "name": "B2 机柜",
         "type": "rack",
         "critical": false,
-        "dependencies": ["dc-east-2"]
+        "dependencies": [
+          "dc-east-2"
+        ]
       },
       {
         "id": "storage-prod",
         "name": "结算生产存储",
         "type": "storage",
         "critical": true,
-        "dependencies": ["rack-b2"]
+        "dependencies": [
+          "rack-b2"
+        ]
       },
       {
         "id": "svc-settle",
         "name": "结算服务",
         "type": "service",
         "critical": true,
-        "dependencies": ["storage-prod"]
+        "dependencies": [
+          "storage-prod"
+        ]
       }
     ],
     "steps": [
@@ -190,7 +212,8 @@
         "owner": "陈若宁",
         "durationMinutes": 45,
         "command": "ceph osd crush reweight node-b2-07 0",
-        "completed": false
+        "completed": false,
+        "revertStepId": "step-3"
       }
     ],
     "window": {
@@ -262,7 +285,10 @@
     "title": "风控规则引擎证书轮换",
     "summary": "轮换风控网关双向 TLS 证书并更新调用方信任链。",
     "owner": "许月",
-    "onCall": ["许月", "李承"],
+    "onCall": [
+      "许月",
+      "李承"
+    ],
     "status": "draft",
     "risk": "medium",
     "resources": [
@@ -307,7 +333,8 @@
         "owner": "许月",
         "durationMinutes": 15,
         "command": "kubectl apply -f cert-previous.yaml",
-        "completed": false
+        "completed": false,
+        "revertStepId": "step-2"
       }
     ],
     "window": {
@@ -352,7 +379,9 @@
     "title": "日志平台索引模板切换",
     "summary": "切换日志平台索引模板并保留双写 24 小时。",
     "owner": "杜衡",
-    "onCall": ["杜衡"],
+    "onCall": [
+      "杜衡"
+    ],
     "status": "completed",
     "risk": "low",
     "resources": [
@@ -382,7 +411,8 @@
         "owner": "杜衡",
         "durationMinutes": 15,
         "command": "logctl template rollback",
-        "completed": false
+        "completed": false,
+        "revertStepId": "step-1"
       }
     ],
     "window": {
