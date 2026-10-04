@@ -19,11 +19,21 @@ import {
   ChangeRequest,
   ChangeStep,
   DeviationRecord,
+  LEDGER_STATE_LABELS,
+  OperationLedgerEntry,
   PHASE_LABELS,
   RESOURCE_LABELS,
   RISK_LABELS,
   STAGE_LABELS,
   STATUS_LABELS,
+  StepLedgerState,
+  buildRollbackPlan,
+  confirmedStepCount,
+  hasFailedLedger,
+  hasPendingLedger,
+  latestLedgerEntry,
+  pendingStepCount,
+  stepLedgerState,
   validateChange,
 } from '../../models/change-request.model';
 import { ChangeRequestService } from '../../services/change-request.service';
@@ -258,7 +268,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <span>勾选即留下待确认底账，回包到达才记完成，重开可续接</span>
                 </div>
                 @if (item.status === 'approved') {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
@@ -266,22 +276,75 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </button>
                 }
               </div>
+
+              @if (!item.ledger) {
+                <div class="ledger-note">
+                  <strong>旧记录 · 无操作底账</strong>
+                  <p>
+                    该记录没有操作底账，仅只读展示。历史勾选未经回包确认，不代表已执行完成。
+                  </p>
+                </div>
+              }
+
               <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
-                  <label class="step-row" [class.completed]="step.completed">
+                @for (row of stepRows(); track row.step.id) {
+                  <div
+                    class="step-row"
+                    [class.completed]="row.state === 'confirmed'"
+                    [class.failed]="row.state === 'failed'"
+                  >
                     <input
                       type="checkbox"
-                      [checked]="step.completed"
-                      [disabled]="item.status !== 'executing'"
-                      (change)="toggleStep(step.id)"
+                      [checked]="
+                        row.state === 'confirmed' || (row.state === 'legacy' && row.step.completed)
+                      "
+                      [indeterminate]="row.state === 'pending'"
+                      [disabled]="
+                        (row.state !== 'idle' && row.state !== 'failed') ||
+                        item.status !== 'executing'
+                      "
+                      (change)="requestStep(row.step.id)"
                     />
-                    <span class="phase">{{ phaseLabel(step.phase) }}</span>
+                    <span class="phase">{{ phaseLabel(row.step.phase) }}</span>
                     <div>
-                      <strong>{{ step.title }}</strong>
-                      <code>{{ step.command || '未填写命令' }}</code>
+                      <strong>{{ row.step.title }}</strong>
+                      <code>{{ row.step.command || '未填写命令' }}</code>
+                      @if (row.entry; as entry) {
+                        <small class="ledger-meta">
+                          @switch (entry.status) {
+                            @case ('pending') {
+                              下发于 {{ entry.requestedAt | date: 'MM-dd HH:mm:ss' }} · 等待回包
+                            }
+                            @case ('confirmed') {
+                              回包确认于 {{ entry.confirmedAt | date: 'MM-dd HH:mm:ss' }}
+                            }
+                            @case ('failed') {
+                              已标记失败 · 可重新勾选重试
+                            }
+                          }
+                        </small>
+                      }
                     </div>
-                    <span>{{ step.owner || '未指定' }}</span>
-                  </label>
+                    <span>{{ row.step.owner || '未指定' }}</span>
+                    <span class="ledger-state" [class]="row.state">
+                      {{ ledgerStateLabel(row.state) }}
+                    </span>
+                  </div>
+                  @if (row.state === 'pending' && item.status === 'executing') {
+                    <div class="pending-actions">
+                      <span>回包未到达，可继续等待或人工处置：</span>
+                      <button class="btn btn-sm" type="button" (click)="resolveStep(row.step.id, 'confirmed')">
+                        补成
+                      </button>
+                      <button
+                        class="btn btn-sm btn-danger-outline"
+                        type="button"
+                        (click)="resolveStep(row.step.id, 'failed')"
+                      >
+                        标记失败
+                      </button>
+                    </div>
+                  }
                 } @empty {
                   <p class="empty">没有执行步骤。</p>
                 }
@@ -298,7 +361,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   打开实时日志
                 </a>
               </div>
-              @if (item.status === 'executing') {
+              @if (item.status === 'executing' && item.ledger) {
                 <div class="deviation-form">
                   <clr-textarea-container>
                     <label>偏离说明</label>
@@ -328,10 +391,18 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 </div>
                 <div class="completion-actions">
                   <button class="btn" type="button" (click)="complete('rolled_back')">判定回滚</button>
-                  <button class="btn btn-primary" type="button" (click)="complete('completed')">
+                  <button
+                    class="btn btn-primary"
+                    type="button"
+                    (click)="complete('completed')"
+                    [disabled]="hasPending()"
+                  >
                     执行完成
                   </button>
                 </div>
+                @if (hasPending()) {
+                  <p class="pending-hint">存在待确认动作，回包到达或人工处置后才能判定完成。</p>
+                }
               }
               <div class="deviation-list">
                 @for (deviation of item.deviations; track deviation.id) {
@@ -348,6 +419,50 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 }
               </div>
             </section>
+
+            @if (rollbackPlan(); as plan) {
+              <section class="surface span-2">
+                <div class="surface-heading">
+                  <div>
+                    <h2>回滚顺序</h2>
+                    <span>按已确认动作从后往前生成，准备与未执行动作不混入</span>
+                  </div>
+                </div>
+                @if (hasFailed()) {
+                  <p class="rollback-alert">存在失败动作，请按以下顺序执行回滚。</p>
+                }
+                @if (plan.items.length) {
+                  <ol class="rollback-list">
+                    @for (planItem of plan.items; track planItem.stepId) {
+                      <li>
+                        <span class="flow-index">{{ $index + 1 }}</span>
+                        <div>
+                          <strong>撤销「{{ planItem.title }}」</strong>
+                          <small>
+                            {{ planItem.owner || '未指定' }} · 确认于
+                            {{ planItem.confirmedAt | date: 'MM-dd HH:mm:ss' }}
+                          </small>
+                        </div>
+                      </li>
+                    }
+                  </ol>
+                  @if (plan.rollbackSteps.length) {
+                    <div class="rollback-commands">
+                      <h3>方案回滚步骤</h3>
+                      @for (rollbackStep of plan.rollbackSteps; track rollbackStep.id) {
+                        <div class="rollback-command">
+                          <strong>{{ rollbackStep.title }}</strong>
+                          <code>{{ rollbackStep.command || '未填写命令' }}</code>
+                          <span>{{ rollbackStep.owner || '未指定' }}</span>
+                        </div>
+                      }
+                    </div>
+                  }
+                } @else {
+                  <p class="empty">尚无已确认的执行动作，无需回滚。</p>
+                }
+              </section>
+            }
           </div>
         }
 
@@ -488,8 +603,17 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <dd>{{ item.audit.length }} 条</dd>
                 </div>
                 <div>
-                  <dt>完成步骤</dt>
-                  <dd>{{ completedSteps(item) }} / {{ item.steps.length }}</dd>
+                  <dt>已确认步骤</dt>
+                  <dd>
+                    @if (item.ledger) {
+                      {{ confirmedSteps(item) }} / {{ item.steps.length }}
+                      @if (pendingSteps(item) > 0) {
+                        <small>（{{ pendingSteps(item) }} 项待确认）</small>
+                      }
+                    } @else {
+                      无底账 · 未确认
+                    }
+                  </dd>
                 </div>
               </dl>
               <div class="retrospective-note">
@@ -782,7 +906,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
 
       .step-row {
         display: grid;
-        grid-template-columns: 20px 50px 1fr 90px;
+        grid-template-columns: 20px 50px 1fr 90px 76px;
         align-items: center;
         gap: 12px;
         padding: 14px 2px;
@@ -793,6 +917,10 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         background: #f5faf6;
       }
 
+      .step-row.failed {
+        background: #fbf1ef;
+      }
+
       .step-row div {
         display: flex;
         flex-direction: column;
@@ -801,6 +929,126 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
       .step-row code {
         margin-top: 4px;
         color: #666;
+        font-size: 11px;
+      }
+
+      .ledger-meta {
+        margin-top: 4px;
+        color: #737373;
+        font-size: 11px;
+      }
+
+      .ledger-state {
+        display: inline-block;
+        padding: 2px 7px;
+        border: 1px solid #a4a4a4;
+        background: #f2f2f2;
+        color: #414141;
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .ledger-state.pending {
+        border-color: #d0a251;
+        background: #fff7e6;
+        color: #7c5000;
+      }
+
+      .ledger-state.confirmed {
+        border-color: #8fb99f;
+        background: #edf7f0;
+        color: #286140;
+      }
+
+      .ledger-state.failed {
+        border-color: #d58d7e;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .ledger-note {
+        margin: 14px 0 4px;
+        padding: 12px 14px;
+        border-left: 3px solid #9a9a9a;
+        background: #f4f4f4;
+      }
+
+      .ledger-note p {
+        margin: 6px 0 0;
+        color: #5f5f5f;
+        font-size: 12px;
+      }
+
+      .pending-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 2px 14px 32px;
+        border-bottom: 1px solid #e6e6e6;
+        color: #7c5000;
+        font-size: 12px;
+      }
+
+      .pending-hint {
+        margin: 10px 0 0;
+        color: #7c5000;
+        font-size: 12px;
+        text-align: right;
+      }
+
+      .rollback-alert {
+        margin: 14px 0 0;
+        padding: 12px 14px;
+        border-left: 3px solid #c21d00;
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .rollback-list {
+        margin: 16px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .rollback-list li {
+        display: grid;
+        grid-template-columns: 32px 1fr;
+        gap: 12px;
+        padding: 10px 0;
+        border-bottom: 1px solid #e6e6e6;
+      }
+
+      .rollback-list small {
+        display: block;
+        margin-top: 4px;
+        color: #737373;
+      }
+
+      .rollback-commands {
+        margin-top: 16px;
+      }
+
+      .rollback-commands h3 {
+        margin: 0 0 8px;
+        font-size: 13px;
+      }
+
+      .rollback-command {
+        display: grid;
+        grid-template-columns: minmax(160px, 1fr) 2fr 90px;
+        align-items: center;
+        gap: 14px;
+        padding: 10px 0;
+        border-top: 1px solid #e6e6e6;
+      }
+
+      .rollback-command code {
+        color: #666;
+        font-size: 11px;
+      }
+
+      .rollback-command span {
+        color: #6b6b6b;
         font-size: 11px;
       }
 
@@ -1006,6 +1254,37 @@ export class ChangeDetailComponent {
     this.issues().some((issue) => issue.severity === 'blocker'),
   );
 
+  /** 步骤行视图模型：步骤 + 底账状态 + 最新底账条目。 */
+  readonly stepRows = computed<
+    Array<{ step: ChangeStep; state: StepLedgerState; entry?: OperationLedgerEntry }>
+  >(() => {
+    const item = this.change();
+    if (!item) {
+      return [];
+    }
+    return this.stepsBy(item).map((step) => ({
+      step,
+      state: stepLedgerState(item, step.id),
+      entry: item.ledger ? latestLedgerEntry(item.ledger, step.id) : undefined,
+    }));
+  });
+
+  /** 无底账的旧记录不生成回滚顺序。 */
+  readonly rollbackPlan = computed(() => {
+    const item = this.change();
+    return item?.ledger ? buildRollbackPlan(item) : null;
+  });
+
+  readonly hasPending = computed(() => {
+    const item = this.change();
+    return item ? hasPendingLedger(item) : false;
+  });
+
+  readonly hasFailed = computed(() => {
+    const item = this.change();
+    return item ? hasFailedLedger(item) : false;
+  });
+
   readonly pendingStage = computed<ApprovalStage | null>(() => {
     const item = this.change();
     if (!item || !['submitted', 'rejected'].includes(item.status)) {
@@ -1104,8 +1383,18 @@ export class ChangeDetailComponent {
     this.store.dispatch(ChangeRequestActions.startExecution({ id: this.changeId }));
   }
 
-  toggleStep(stepId: string): void {
-    this.store.dispatch(ChangeRequestActions.toggleStep({ id: this.changeId, stepId }));
+  requestStep(stepId: string): void {
+    this.store.dispatch(ChangeRequestActions.requestStep({ id: this.changeId, stepId }));
+  }
+
+  resolveStep(stepId: string, resolution: 'confirmed' | 'failed'): void {
+    const note =
+      resolution === 'confirmed'
+        ? '回包丢失，经人工核实确认已执行，补记完成。'
+        : '回包丢失且无法核实执行结果，人工标记失败。';
+    this.store.dispatch(
+      ChangeRequestActions.resolveStep({ id: this.changeId, stepId, resolution, note }),
+    );
   }
 
   recordDeviation(): void {
@@ -1156,8 +1445,16 @@ export class ChangeDetailComponent {
     });
   }
 
-  completedSteps(change: ChangeRequest): number {
-    return change.steps.filter((step) => step.completed).length;
+  confirmedSteps(change: ChangeRequest): number {
+    return confirmedStepCount(change);
+  }
+
+  pendingSteps(change: ChangeRequest): number {
+    return pendingStepCount(change);
+  }
+
+  ledgerStateLabel(state: StepLedgerState): string {
+    return LEDGER_STATE_LABELS[state];
   }
 
   statusLabel(status: ChangeRequest['status']): string {

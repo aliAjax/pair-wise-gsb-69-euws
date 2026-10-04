@@ -3,7 +3,11 @@ import {
   ApprovalStage,
   ChangeRequest,
   APPROVAL_ORDER,
+  confirmEntry,
   createAudit,
+  hasPendingLedger,
+  requestEntry,
+  resolveEntry,
 } from '../models/change-request.model';
 import { ChangeRequestActions } from './change-request.actions';
 
@@ -27,6 +31,10 @@ function nextPendingStage(change: ChangeRequest): ApprovalStage | null {
   return APPROVAL_ORDER.find((stage) =>
     change.approvals.some((approval) => approval.stage === stage && approval.state === 'pending'),
   ) ?? null;
+}
+
+function nextLedgerEntryId(): string {
+  return `op-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 export const changeRequestReducer = createReducer(
@@ -148,29 +156,98 @@ export const changeRequestReducer = createReducer(
             ...change,
             status: 'executing',
             approvals: change.approvals.map((approval) => ({ ...approval, state: 'frozen' })),
+            // 开启操作底账，此后勾选、回包、人工处置全部落账，可续接
+            ledger: change.ledger ?? [],
             audit: [createAudit('开始执行', '审批记录已冻结，进入执行状态'), ...change.audit],
           })
         : change,
     ),
   })),
-  on(ChangeRequestActions.toggleStep, (state, { id, stepId }) => ({
+  on(ChangeRequestActions.requestStep, (state, { id, stepId }) => ({
     ...state,
-    changes: state.changes.map((change) =>
-      change.id === id
-        ? touch({
-            ...change,
-            steps: change.steps.map((step) =>
-              step.id === stepId
-                ? {
-                    ...step,
-                    completed: !step.completed,
-                    completedAt: step.completed ? undefined : new Date().toISOString(),
-                  }
-                : step,
-            ),
-          })
-        : change,
-    ),
+    changes: state.changes.map((change) => {
+      if (change.id !== id || change.status !== 'executing' || !change.ledger) {
+        return change;
+      }
+      const step = change.steps.find((candidate) => candidate.id === stepId);
+      if (!step) {
+        return change;
+      }
+      const transition = requestEntry(change.ledger, stepId, nextLedgerEntryId(), new Date().toISOString());
+      if (!transition) {
+        // 已有待确认条目，重复勾选不多记
+        return change;
+      }
+      return touch({
+        ...change,
+        ledger: transition.ledger,
+        audit: [
+          createAudit('下发命令', `步骤“${step.title}”已下发命令，等待回包确认`),
+          ...change.audit,
+        ],
+      });
+    }),
+  })),
+  on(ChangeRequestActions.ackStep, (state, { id, stepId }) => ({
+    ...state,
+    changes: state.changes.map((change) => {
+      if (change.id !== id || change.status !== 'executing' || !change.ledger) {
+        return change;
+      }
+      const transition = confirmEntry(change.ledger, stepId, new Date().toISOString());
+      if (!transition) {
+        // 重复回包或无待发记录：只认第一次，审计和耗时不多记
+        return change;
+      }
+      const step = change.steps.find((candidate) => candidate.id === stepId);
+      const confirmedAt = transition.entry.confirmedAt as string;
+      return touch({
+        ...change,
+        ledger: transition.ledger,
+        steps: change.steps.map((candidate) =>
+          candidate.id === stepId
+            ? { ...candidate, completed: true, completedAt: confirmedAt }
+            : candidate,
+        ),
+        audit: [
+          createAudit('回包确认', `步骤“${step?.title ?? stepId}”回包到达，记为完成`),
+          ...change.audit,
+        ],
+      });
+    }),
+  })),
+  on(ChangeRequestActions.resolveStep, (state, { id, stepId, resolution, note }) => ({
+    ...state,
+    changes: state.changes.map((change) => {
+      if (change.id !== id || change.status !== 'executing' || !change.ledger) {
+        return change;
+      }
+      const transition = resolveEntry(change.ledger, stepId, resolution, new Date().toISOString());
+      if (!transition) {
+        return change;
+      }
+      const step = change.steps.find((candidate) => candidate.id === stepId);
+      const confirmedAt = transition.entry.confirmedAt;
+      return touch({
+        ...change,
+        ledger: transition.ledger,
+        steps:
+          resolution === 'confirmed'
+            ? change.steps.map((candidate) =>
+                candidate.id === stepId
+                  ? { ...candidate, completed: true, completedAt: confirmedAt }
+                  : candidate,
+              )
+            : change.steps,
+        audit: [
+          createAudit(
+            resolution === 'confirmed' ? '人工补成' : '标记失败',
+            `步骤“${step?.title ?? stepId}”：${note}`,
+          ),
+          ...change.audit,
+        ],
+      });
+    }),
   })),
   on(ChangeRequestActions.recordDeviation, (state, { id, deviation }) => ({
     ...state,
@@ -190,7 +267,10 @@ export const changeRequestReducer = createReducer(
   on(ChangeRequestActions.completeExecution, (state, { id, result, note }) => ({
     ...state,
     changes: state.changes.map((change) =>
-      change.id === id && change.status === 'executing'
+      change.id === id &&
+      change.status === 'executing' &&
+      // 有待确认动作时不允许判定完成，必须等回包或人工处置
+      !(result === 'completed' && hasPendingLedger(change))
         ? touch({
             ...change,
             status: result,

@@ -14,6 +14,29 @@ export type ApprovalState = 'pending' | 'approved' | 'rejected' | 'frozen';
 export type StepPhase = 'prepare' | 'execute' | 'verify' | 'rollback';
 export type IssueSeverity = 'blocker' | 'warning' | 'info';
 
+/**
+ * 操作底账条目状态：
+ * - pending：已勾选下发，等待命令回包
+ * - confirmed：回包到达（或人工补成），记为完成
+ * - failed：人工标记失败
+ */
+export type LedgerEntryStatus = 'pending' | 'confirmed' | 'failed';
+
+/** 步骤在底账中的呈现状态；legacy 表示旧记录没有底账，只读展示。 */
+export type StepLedgerState = 'legacy' | 'idle' | LedgerEntryStatus;
+
+/**
+ * 操作底账条目。一次勾选对应一条待确认记录，
+ * 回包到达才把同一条目转为 confirmed；字段保持精简，不堆砌冗余耗时。
+ */
+export interface OperationLedgerEntry {
+  id: string;
+  stepId: string;
+  status: LedgerEntryStatus;
+  requestedAt: string;
+  confirmedAt?: string;
+}
+
 export interface ChangeResource {
   id: string;
   name: string;
@@ -78,6 +101,8 @@ export interface ChangeRequest {
   approvals: ApprovalRecord[];
   deviations: DeviationRecord[];
   audit: AuditRecord[];
+  /** 操作底账；旧记录没有该字段，只读展示，不当作已执行完。 */
+  ledger?: OperationLedgerEntry[];
   createdAt: string;
   updatedAt: string;
 }
@@ -289,5 +314,161 @@ export function createAudit(
     actor,
     action,
     detail,
+  };
+}
+
+export const LEDGER_STATE_LABELS: Record<StepLedgerState, string> = {
+  legacy: '无底账',
+  idle: '未下发',
+  pending: '待确认',
+  confirmed: '已确认',
+  failed: '已失败',
+};
+
+/** 取某步骤最新一条底账（底账是追加式流水，同一步骤可能有多条）。 */
+export function latestLedgerEntry(
+  ledger: OperationLedgerEntry[],
+  stepId: string,
+): OperationLedgerEntry | undefined {
+  for (let index = ledger.length - 1; index >= 0; index -= 1) {
+    if (ledger[index].stepId === stepId) {
+      return ledger[index];
+    }
+  }
+  return undefined;
+}
+
+export interface LedgerTransition {
+  ledger: OperationLedgerEntry[];
+  entry: OperationLedgerEntry;
+}
+
+function replaceLedgerEntry(
+  ledger: OperationLedgerEntry[],
+  entry: OperationLedgerEntry,
+): OperationLedgerEntry[] {
+  return ledger.map((item) => (item.id === entry.id ? entry : item));
+}
+
+/** 勾选下发：留下待确认条目；已有待确认条目时返回 null，重复勾选不多记。 */
+export function requestEntry(
+  ledger: OperationLedgerEntry[],
+  stepId: string,
+  entryId: string,
+  requestedAt: string,
+): LedgerTransition | null {
+  if (latestLedgerEntry(ledger, stepId)?.status === 'pending') {
+    return null;
+  }
+  const entry: OperationLedgerEntry = { id: entryId, stepId, status: 'pending', requestedAt };
+  return { ledger: [...ledger, entry], entry };
+}
+
+/** 回包确认：只作用于待确认条目；重复回包或无待发记录返回 null，只认第一次。 */
+export function confirmEntry(
+  ledger: OperationLedgerEntry[],
+  stepId: string,
+  confirmedAt: string,
+): LedgerTransition | null {
+  const latest = latestLedgerEntry(ledger, stepId);
+  if (!latest || latest.status !== 'pending') {
+    return null;
+  }
+  const entry: OperationLedgerEntry = { ...latest, status: 'confirmed', confirmedAt };
+  return { ledger: replaceLedgerEntry(ledger, entry), entry };
+}
+
+/** 人工处置：重开后对待确认条目补成或标记失败；非待确认条目返回 null。 */
+export function resolveEntry(
+  ledger: OperationLedgerEntry[],
+  stepId: string,
+  resolution: 'confirmed' | 'failed',
+  resolvedAt: string,
+): LedgerTransition | null {
+  const latest = latestLedgerEntry(ledger, stepId);
+  if (!latest || latest.status !== 'pending') {
+    return null;
+  }
+  const entry: OperationLedgerEntry =
+    resolution === 'confirmed'
+      ? { ...latest, status: 'confirmed', confirmedAt: resolvedAt }
+      : { ...latest, status: 'failed' };
+  return { ledger: replaceLedgerEntry(ledger, entry), entry };
+}
+
+export function stepLedgerState(change: ChangeRequest, stepId: string): StepLedgerState {
+  if (!change.ledger) {
+    return 'legacy';
+  }
+  return latestLedgerEntry(change.ledger, stepId)?.status ?? 'idle';
+}
+
+export function hasPendingLedger(change: ChangeRequest): boolean {
+  return (change.ledger ?? []).some((entry) => entry.status === 'pending');
+}
+
+export function hasFailedLedger(change: ChangeRequest): boolean {
+  return (change.ledger ?? []).some((entry) => entry.status === 'failed');
+}
+
+export function confirmedStepCount(change: ChangeRequest): number {
+  const ledger = change.ledger;
+  if (!ledger) {
+    return 0;
+  }
+  return change.steps.filter((step) => latestLedgerEntry(ledger, step.id)?.status === 'confirmed')
+    .length;
+}
+
+export function pendingStepCount(change: ChangeRequest): number {
+  return (change.ledger ?? []).filter((entry) => entry.status === 'pending').length;
+}
+
+export interface RollbackPlanItem {
+  stepId: string;
+  title: string;
+  owner: string;
+  confirmedAt: string;
+}
+
+export interface RollbackPlan {
+  /** 已确认的执行类动作，按确认时间从后往前排列。 */
+  items: RollbackPlanItem[];
+  /** 方案预定义的回滚步骤，按定义顺序。 */
+  rollbackSteps: ChangeStep[];
+}
+
+/**
+ * 生成回滚顺序：以每个步骤最新底账为准，仅纳入已确认的执行类动作，
+ * 从后往前排列；准备动作与未执行（未下发/待确认/已失败）动作不混入。
+ */
+export function buildRollbackPlan(change: ChangeRequest): RollbackPlan {
+  const ledger = change.ledger ?? [];
+  const items = change.steps
+    .map((step, stepIndex) => ({ step, stepIndex, entry: latestLedgerEntry(ledger, step.id) }))
+    .filter(
+      (
+        candidate,
+      ): candidate is { step: ChangeStep; stepIndex: number; entry: OperationLedgerEntry } =>
+        candidate.entry !== undefined &&
+        candidate.entry.status === 'confirmed' &&
+        candidate.step.phase === 'execute',
+    )
+    .sort((left, right) => {
+      const byConfirmedAt = (right.entry.confirmedAt ?? '').localeCompare(
+        left.entry.confirmedAt ?? '',
+      );
+      return byConfirmedAt !== 0 ? byConfirmedAt : right.stepIndex - left.stepIndex;
+    })
+    .map(({ step, entry }) => ({
+      stepId: step.id,
+      title: step.title,
+      owner: step.owner,
+      confirmedAt: entry.confirmedAt ?? '',
+    }));
+
+  return {
+    items,
+    rollbackSteps: change.steps.filter((step) => step.phase === 'rollback'),
   };
 }

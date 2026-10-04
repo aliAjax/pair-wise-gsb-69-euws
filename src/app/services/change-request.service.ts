@@ -1,6 +1,6 @@
 import { HttpClient } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
-import { catchError, Observable, of, tap } from 'rxjs';
+import { catchError, map, Observable, of, tap, timer } from 'rxjs';
 import { ChangeRequest } from '../models/change-request.model';
 
 const STORAGE_KEY = 'pair-wise-gsb-69-changes';
@@ -30,6 +30,15 @@ export class ChangeRequestService {
 
   save(changes: ChangeRequest[]): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(changes));
+  }
+
+  /**
+   * 模拟弱网机房的命令网关：回包延迟到达。
+   * 页面在回包前崩溃或刷新则回包丢失，待确认底账已持久化，
+   * 重开后由值班人员补成或标记失败。
+   */
+  sendCommand(changeId: string, stepId: string): Observable<{ changeId: string; stepId: string }> {
+    return timer(1500).pipe(map(() => ({ changeId, stepId })));
   }
 
   exportRetrospective(change: ChangeRequest): string {

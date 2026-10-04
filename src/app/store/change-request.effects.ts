@@ -1,7 +1,7 @@
 import { inject, Injectable } from '@angular/core';
 import { Actions, createEffect, ofType } from '@ngrx/effects';
 import { Store } from '@ngrx/store';
-import { catchError, map, of, switchMap, tap, withLatestFrom } from 'rxjs';
+import { catchError, map, mergeMap, of, switchMap, tap, withLatestFrom } from 'rxjs';
 import { ChangeRequestService } from '../services/change-request.service';
 import { ChangeRequestActions } from './change-request.actions';
 import { selectAllChanges } from './change-request.selectors';
@@ -30,6 +30,21 @@ export class ChangeRequestEffects {
     ),
   );
 
+  /**
+   * 勾选后向网关下发命令，回包到达才记完成。
+   * 若回包到达前条目已被人工处置，ackStep 在 reducer 中幂等忽略。
+   */
+  dispatchCommand$ = createEffect(() =>
+    this.actions$.pipe(
+      ofType(ChangeRequestActions.requestStep),
+      mergeMap(({ id, stepId }) =>
+        this.service.sendCommand(id, stepId).pipe(
+          map(() => ChangeRequestActions.ackStep({ id, stepId })),
+        ),
+      ),
+    ),
+  );
+
   persistChanges$ = createEffect(
     () =>
       this.actions$.pipe(
@@ -41,7 +56,9 @@ export class ChangeRequestEffects {
           ChangeRequestActions.approveStage,
           ChangeRequestActions.rejectStage,
           ChangeRequestActions.startExecution,
-          ChangeRequestActions.toggleStep,
+          ChangeRequestActions.requestStep,
+          ChangeRequestActions.ackStep,
+          ChangeRequestActions.resolveStep,
           ChangeRequestActions.recordDeviation,
           ChangeRequestActions.completeExecution,
         ),

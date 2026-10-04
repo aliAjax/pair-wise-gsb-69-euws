@@ -18,7 +18,14 @@ export const ChangeRequestActions = createActionGroup({
     'Approve Stage': props<{ id: string; stage: ApprovalStage; approver: string; comment: string }>(),
     'Reject Stage': props<{ id: string; stage: ApprovalStage; approver: string; comment: string }>(),
     'Start Execution': props<{ id: string }>(),
-    'Toggle Step': props<{ id: string; stepId: string }>(),
+    'Request Step': props<{ id: string; stepId: string }>(),
+    'Ack Step': props<{ id: string; stepId: string }>(),
+    'Resolve Step': props<{
+      id: string;
+      stepId: string;
+      resolution: 'confirmed' | 'failed';
+      note: string;
+    }>(),
     'Record Deviation': props<{ id: string; deviation: DeviationRecord }>(),
     'Complete Execution': props<{ id: string; result: 'completed' | 'rolled_back'; note: string }>(),
   },
